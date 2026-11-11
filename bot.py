@@ -28,6 +28,12 @@ LEGACY_TOKENS_FILE = DATA_DIR / "session_tokens.json"
 INACTIVE_TIMEOUT_SECONDS = 21 * 86400  # 3 weeks (21 days)
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 
+# Anti-spam & DDoS protection limits
+LEADERBOARD_CACHE_TTL = 900.0       # 15 minutes cache for the whole leaderboard
+USER_SCORE_CACHE_TTL = 3600.0      # 1 hour cache per user score (shield other users' accounts from repeated API calls)
+USER_ACTION_MIN_INTERVAL = 3.0     # 3 seconds cooldown between manual API calls per user
+CHAT_BOARD_MIN_INTERVAL = 8.0      # 8 seconds cooldown on /board per chat to avoid group spam
+
 POPULAR_SPORTS = [
     "Бадминтон",
     "Волейбол",
@@ -75,6 +81,7 @@ def default_user_profile(user_id: int, name: str = "", username: str = "") -> di
             "expires_at": 0.0,
         },
         "cached_score": None,
+        "cached_score_ts": 0.0,
     }
 
 
@@ -127,6 +134,38 @@ class TelegramBot:
         self.offset = 0
         self.bot_username = ""
         self._clients: dict[str, ItmoSportClient] = {}
+        self._user_cooldowns: dict[tuple[int, str], float] = {}
+        self._chat_board_cooldowns: dict[int, float] = {}
+        self._cached_leaderboard: list[tuple[int, str]] = []
+        self._leaderboard_updated_at: float = 0.0
+        self._leaderboard_lock = asyncio.Lock()
+
+    def check_user_rate_limit(self, user_id: int, action: str = "general", min_interval: float = USER_ACTION_MIN_INTERVAL) -> tuple[bool, float]:
+        """
+        Anti-spam / DDoS check for a specific user action.
+        Returns (is_allowed, remaining_seconds).
+        """
+        now = time.time()
+        key = (user_id, action)
+        last_time = self._user_cooldowns.get(key, 0.0)
+        elapsed = now - last_time
+        if elapsed < min_interval:
+            return False, round(min_interval - elapsed, 1)
+        self._user_cooldowns[key] = now
+        return True, 0.0
+
+    def check_chat_board_rate_limit(self, chat_id: int, min_interval: float = CHAT_BOARD_MIN_INTERVAL) -> tuple[bool, float]:
+        """
+        Prevents spamming /board in chats.
+        Returns (is_allowed, remaining_seconds).
+        """
+        now = time.time()
+        last_time = self._chat_board_cooldowns.get(chat_id, 0.0)
+        elapsed = now - last_time
+        if elapsed < min_interval:
+            return False, round(min_interval - elapsed, 1)
+        self._chat_board_cooldowns[chat_id] = now
+        return True, 0.0
 
     def get_user(self, user_id: int, tg_user: dict[str, Any] | None = None, touch: bool = True) -> dict[str, Any]:
         uid = str(user_id)
@@ -483,6 +522,7 @@ class TelegramBot:
             data = await client.get_score_and_attempts()
             sums = (data.get("score") or {}).get("sum") or {}
             prof["cached_score"] = int(sums.get("attendances", 0) or 0) + int(sums.get("other", 0) or 0)
+            prof["cached_score_ts"] = time.time()
             save_db(self.db)
             await self.send_message(chat_id, self.format_score_card(prof, data))
         except Exception as e:
@@ -944,32 +984,66 @@ class TelegramBot:
                 "Если захочешь вернуться — просто напиши <code>/start</code>!",
             )
 
-        elif data == "scan_free":
-            await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Ищу доступные слоты на 3 недели..."})
-            await self.run_user_scan(chat_id, user_id, show_all=False, manual=True)
-
-        elif data == "scan_all":
-            await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Загружаю все слоты на 3 недели..."})
-            await self.run_user_scan(chat_id, user_id, show_all=True, manual=True)
-
-        elif data.startswith("grp_slots:"):
-            sp_name = data.split(":", 1)[1]
-            await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": f"Ищу свободные слоты: {sp_name}..."})
-            await self.run_user_scan(chat_id, user_id, show_all=False, manual=True, override_sport=sp_name)
+        elif data in ("scan_free", "scan_all") or data.startswith("grp_slots:"):
+            allowed, remain = self.check_user_rate_limit(user_id, "scan", USER_ACTION_MIN_INTERVAL)
+            if not allowed:
+                await self.tg_call(
+                    "answerCallbackQuery",
+                    {"callback_query_id": cq_id, "text": f"⏳ Подожди {remain} с перед следующим поиском...", "show_alert": False},
+                )
+                return
+            if data == "scan_free":
+                await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Ищу доступные слоты на 3 недели..."})
+                await self.run_user_scan(chat_id, user_id, show_all=False, manual=True)
+            elif data == "scan_all":
+                await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Загружаю все слоты на 3 недели..."})
+                await self.run_user_scan(chat_id, user_id, show_all=True, manual=True)
+            else:
+                sp_name = data.split(":", 1)[1]
+                await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": f"Ищу свободные слоты: {sp_name}..."})
+                await self.run_user_scan(chat_id, user_id, show_all=False, manual=True, override_sport=sp_name)
 
         elif data == "grp_leaderboard":
-            await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Обновляю топ баллов..."})
+            allowed, remain = self.check_chat_board_rate_limit(chat_id, min_interval=5.0)
+            if not allowed:
+                await self.tg_call(
+                    "answerCallbackQuery",
+                    {"callback_query_id": cq_id, "text": f"⏳ Подожди {remain} с перед обновлением топа", "show_alert": False},
+                )
+                return
+            await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Загружаю топ баллов..."})
             await self.send_leaderboard(chat_id)
 
         elif data == "my_score":
+            allowed, remain = self.check_user_rate_limit(user_id, "score", USER_ACTION_MIN_INTERVAL)
+            if not allowed:
+                await self.tg_call(
+                    "answerCallbackQuery",
+                    {"callback_query_id": cq_id, "text": f"⏳ Подожди {remain} с перед запросом баллов...", "show_alert": False},
+                )
+                return
             await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Загружаю твои баллы..."})
             await self.send_score(chat_id, user_id, from_user)
 
         elif data == "my_lessons":
+            allowed, remain = self.check_user_rate_limit(user_id, "my", USER_ACTION_MIN_INTERVAL)
+            if not allowed:
+                await self.tg_call(
+                    "answerCallbackQuery",
+                    {"callback_query_id": cq_id, "text": f"⏳ Подожди {remain} с перед запросом записей...", "show_alert": False},
+                )
+                return
             await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Загружаю твои записи..."})
             await self.send_chosen_lessons(chat_id, user_id, from_user)
 
         elif data.startswith("sign:"):
+            allowed, remain = self.check_user_rate_limit(user_id, "sign", min_interval=2.0)
+            if not allowed:
+                await self.tg_call(
+                    "answerCallbackQuery",
+                    {"callback_query_id": cq_id, "text": f"⏳ Подожди {remain} с...", "show_alert": False},
+                )
+                return
             lesson_id = int(data.split(":", 1)[1])
             if not self.is_user_authenticated(prof):
                 await self.tg_call(
@@ -999,6 +1073,13 @@ class TelegramBot:
                 await self.send_message(chat_id, f"❌ Не удалось записаться: <code>{html.escape(str(e))}</code>")
 
         elif data.startswith("unsub:"):
+            allowed, remain = self.check_user_rate_limit(user_id, "unsub", min_interval=2.0)
+            if not allowed:
+                await self.tg_call(
+                    "answerCallbackQuery",
+                    {"callback_query_id": cq_id, "text": f"⏳ Подожди {remain} с...", "show_alert": False},
+                )
+                return
             lesson_id = int(data.split(":", 1)[1])
             await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Отписываю от занятия..."})
             client = self.get_client_for_user(user_id)
@@ -1012,28 +1093,68 @@ class TelegramBot:
             except Exception as e:
                 await self.send_message(chat_id, f"❌ Ошибка при отписке: <code>{html.escape(str(e))}</code>")
 
-    async def send_leaderboard(self, chat_id: int) -> None:
-        board = []
-        for uid, prof in self.db.get("users", {}).items():
-            if not self.is_user_authenticated(prof):
-                continue
-            client = self.get_client_for_user(int(uid))
-            try:
-                data = await client.get_score_and_attempts()
-                sums = (data.get("score") or {}).get("sum") or {}
-                pts = int(sums.get("attendances", 0) or 0) + int(sums.get("other", 0) or 0)
-                prof["cached_score"] = pts
-            except Exception:
-                pts = prof.get("cached_score")
-            if pts is not None:
-                board.append((pts, prof.get("name") or f"User {uid}"))
+    async def get_or_refresh_leaderboard(self) -> tuple[list[tuple[int, str]], float]:
+        """
+        Anti-DDoS & Account Shield for leaderboard:
+        - Returns (board_list, last_updated_ts).
+        - Serves from global cache if updated within LEADERBOARD_CACHE_TTL (15 min).
+        - When refreshing, uses per-user cached score if updated within USER_SCORE_CACHE_TTL (1 hour).
+        - Never bursts requests to ITMO: uses asyncio.Lock and 0.3s spacing between user API calls.
+        - Other users' accounts are NEVER repeatedly contacted when someone requests /board.
+        """
+        now = time.time()
+        if self._cached_leaderboard and (now - self._leaderboard_updated_at < LEADERBOARD_CACHE_TTL):
+            return self._cached_leaderboard, self._leaderboard_updated_at
 
-        save_db(self.db)
+        async with self._leaderboard_lock:
+            now = time.time()
+            if self._cached_leaderboard and (now - self._leaderboard_updated_at < LEADERBOARD_CACHE_TTL):
+                return self._cached_leaderboard, self._leaderboard_updated_at
+
+            board: list[tuple[int, str]] = []
+            changed = False
+            users = list((self.db.get("users") or {}).items())
+
+            for uid, prof in users:
+                if not self.is_user_authenticated(prof):
+                    continue
+
+                pts = prof.get("cached_score")
+                pts_ts = float(prof.get("cached_score_ts") or 0.0)
+
+                # Only fetch from ITMO if there is no cached score or it is older than USER_SCORE_CACHE_TTL (1h)
+                need_fetch = (pts is None) or ((now - pts_ts) > USER_SCORE_CACHE_TTL)
+                if need_fetch:
+                    try:
+                        client = self.get_client_for_user(int(uid))
+                        data = await client.get_score_and_attempts()
+                        sums = (data.get("score") or {}).get("sum") or {}
+                        pts = int(sums.get("attendances", 0) or 0) + int(sums.get("other", 0) or 0)
+                        prof["cached_score"] = pts
+                        prof["cached_score_ts"] = now
+                        changed = True
+                        await asyncio.sleep(0.3)
+                    except Exception as e:
+                        logger.warning(f"Could not refresh score for user {uid} during leaderboard build: {e}")
+                        pts = prof.get("cached_score")
+
+                if pts is not None:
+                    board.append((pts, prof.get("name") or f"User {uid}"))
+
+            if changed:
+                save_db(self.db)
+
+            board.sort(key=lambda x: x[0], reverse=True)
+            self._cached_leaderboard = board
+            self._leaderboard_updated_at = now
+            return self._cached_leaderboard, self._leaderboard_updated_at
+
+    async def send_leaderboard(self, chat_id: int) -> None:
+        board, updated_at = await self.get_or_refresh_leaderboard()
         if not board:
             await self.send_message(chat_id, "📊 Пока никто из участников не авторизовался в боте для подсчёта баллов.")
             return
 
-        board.sort(key=lambda x: x[0], reverse=True)
         medals = ["🥇", "🥈", "🥉"]
         lines = ["📊 <b>Топ баллов за физкультуру ИТМО:</b>\n"]
         for idx, (pts, name) in enumerate(board[:15]):
@@ -1041,6 +1162,15 @@ class TelegramBot:
             status = "✅ Зачёт" if pts >= 100 else f"осталось {100 - pts}"
             lines.append(f"{prefix} <b>{html.escape(name)}</b> — <b>{pts}</b> балл. ({status})")
 
+        age_sec = int(time.time() - updated_at)
+        if age_sec < 60:
+            freshness = "только что"
+        elif age_sec < 3600:
+            freshness = f"{age_sec // 60} мин. назад"
+        else:
+            freshness = f"{age_sec // 3600} ч. назад"
+
+        lines.append(f"\n🛡️ <i>Данные обновлены: {freshness} (кэш защищает аккаунты от спама)</i>")
         await self.send_message(chat_id, "\n".join(lines), reply_markup=self.group_inline_keyboard())
 
     async def send_admin_users(self, chat_id: int) -> None:
@@ -1158,21 +1288,38 @@ class TelegramBot:
                 return
 
         # Bottom ReplyKeyboard button presses in private chat
-        if text == "🔍 Свободные слоты" or cmd == "/check":
-            ovr = arg_str if cmd == "/check" and arg_str else None
-            await self.run_user_scan(chat_id, user_id, show_all=False, manual=True, override_sport=ovr)
-            return
+        if text in ("🔍 Свободные слоты", "📋 Все слоты") or cmd in ("/check", "/all", "/slots", "/free"):
+            allowed, remain = self.check_user_rate_limit(user_id, "scan", USER_ACTION_MIN_INTERVAL)
+            if not allowed:
+                await self.send_message(
+                    chat_id,
+                    f"⏳ <b>Слишком частые запросы!</b> Пожалуйста, подожди {remain} с. перед следующим поиском слотов.",
+                )
+                return
 
-        if text == "📋 Все слоты" or cmd == "/all":
-            ovr = arg_str if cmd == "/all" and arg_str else None
-            await self.run_user_scan(chat_id, user_id, show_all=True, manual=True, override_sport=ovr)
-            return
+            if text == "🔍 Свободные слоты" or cmd in ("/check", "/slots", "/free"):
+                ovr = arg_str if cmd in ("/check", "/slots", "/free") and arg_str else None
+                await self.run_user_scan(chat_id, user_id, show_all=False, manual=True, override_sport=ovr)
+                return
+
+            if text == "📋 Все слоты" or cmd == "/all":
+                ovr = arg_str if cmd == "/all" and arg_str else None
+                await self.run_user_scan(chat_id, user_id, show_all=True, manual=True, override_sport=ovr)
+                return
 
         if text == "🏆 Мои баллы" or cmd in ("/score", "/points"):
+            allowed, remain = self.check_user_rate_limit(user_id, "score", USER_ACTION_MIN_INTERVAL)
+            if not allowed:
+                await self.send_message(chat_id, f"⏳ Подожди {remain} с. перед повторным запросом баллов.")
+                return
             await self.send_score(chat_id, user_id, from_user)
             return
 
         if text == "📅 Мои записи" or cmd == "/my":
+            allowed, remain = self.check_user_rate_limit(user_id, "my", USER_ACTION_MIN_INTERVAL)
+            if not allowed:
+                await self.send_message(chat_id, f"⏳ Подожди {remain} с. перед повторным запросом записей.")
+                return
             await self.send_chosen_lessons(chat_id, user_id, from_user)
             return
 
@@ -1213,11 +1360,13 @@ class TelegramBot:
                 )
             return
 
-        if cmd in ("/slots", "/free"):
-            await self.run_user_scan(chat_id, user_id, show_all=False, manual=True, override_sport=arg_str or None)
-            return
-
         if cmd == "/board":
+            allowed, remain = self.check_chat_board_rate_limit(chat_id, CHAT_BOARD_MIN_INTERVAL)
+            if not allowed:
+                if is_group:
+                    return
+                await self.send_message(chat_id, f"⏳ Топ баллов уже выведен выше. Подожди {remain} с.")
+                return
             await self.send_leaderboard(chat_id)
             return
 
