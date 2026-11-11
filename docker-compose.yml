@@ -1,0 +1,13 @@
+services:
+  botfizra:
+    build: .
+    container_name: botfizra
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Europe/Moscow
+      - DATA_DIR=/app/data
+
