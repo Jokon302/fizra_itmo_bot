@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,18 @@ LEGACY_TOKENS_FILE = DATA_DIR / "session_tokens.json"
 
 INACTIVE_TIMEOUT_SECONDS = 21 * 86400  # 3 weeks (21 days)
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+
+# Timezone & Scheduling
+MSK_TZ = timezone(timedelta(hours=3))
+DEFAULT_CHECK_INTERVAL_MINUTES = 15  # Regular check interval: 15 minutes
+MIDNIGHT_RUSH_INTERVAL_SEC = 30.0   # High-frequency checks during 00:00-00:10 MSK
+
+
+def is_midnight_rush() -> bool:
+    """Returns True if current Moscow time is between 00:00 and 00:10 (slot release window)."""
+    now_msk = datetime.now(MSK_TZ)
+    return now_msk.hour == 0 and 0 <= now_msk.minute < 10
+
 
 # Anti-spam & DDoS protection limits
 LEADERBOARD_CACHE_TTL = 900.0       # 15 minutes cache for the whole leaderboard
@@ -86,12 +98,18 @@ def default_user_profile(user_id: int, name: str = "", username: str = "") -> di
 
 
 def load_db() -> dict[str, Any]:
-    db: dict[str, Any] = {"users": {}, "meta": {"check_interval_minutes": 60}}
+    db: dict[str, Any] = {"users": {}, "meta": {"check_interval_minutes": DEFAULT_CHECK_INTERVAL_MINUTES}}
     if USERS_FILE.exists():
         try:
             db = json.loads(USERS_FILE.read_text(encoding="utf-8"))
         except Exception as e:
             logger.warning(f"Failed to read {USERS_FILE}: {e}")
+
+    meta = db.setdefault("meta", {})
+    # Upgrade check interval to 15 minutes for version 3.2
+    if meta.get("check_interval_minutes") in (60, None):
+        meta["check_interval_minutes"] = DEFAULT_CHECK_INTERVAL_MINUTES
+        save_db(db)
 
     # Migrate legacy single-user state if needed
     if not db.get("users") and LEGACY_STATE_FILE.exists():
@@ -414,16 +432,16 @@ class TelegramBot:
         auth_str = f"✅ Подключена ({login_id})" if (auth_ok and login_id) else (
             "✅ Подключена (по токену)" if auth_ok else "❌ Не подключена (нажми «Профиль» → «Войти»)"
         )
-        mon_str = "🟢 Активен (каждый час)" if prof.get("monitoring_active", True) else "⏸ На паузе"
+        mon_str = "🟢 Активен (каждые 15 мин)" if prof.get("monitoring_active", True) else "⏸ На паузе"
         auto_str = "🟢 Включена (бот запишет сам)" if prof.get("auto_sign_up") else "⚪ Выключена (уведомление + кнопка)"
 
         return (
             "🏸 <b>Бот мониторинга и записи на физру ИТМО</b>\n\n"
             f"👤 <b>Пользователь:</b> {html.escape(prof.get('name') or str(prof['user_id']))}\n"
             f"🔐 <b>Авторизация ИСУ:</b> {auth_str}\n"
-            f"📡 <b>Ежечасный поиск:</b> {mon_str}\n"
+            f"📡 <b>Фоновый мониторинг:</b> {mon_str}\n"
             f"🤖 <b>Автозапись:</b> {auto_str}\n\n"
-            "🎯 <b>Твой фильтр поиска (на 3 недели вперёд):</b>\n"
+            "🎯 <b>Твой фильтр поиска слотов:</b>\n"
             f"• <b>Секции:</b> {html.escape(sports_str)}\n"
             f"• <b>Дни:</b> {days_str}\n"
             f"• <b>Время:</b> {times_str}\n"
@@ -622,11 +640,11 @@ class TelegramBot:
             if not slots:
                 await self.send_message(
                     chat_id,
-                    "📭 На ближайшие 3 недели не найдено занятий по выбранному фильтру.",
+                    "📭 Не найдено занятий по выбранному фильтру.",
                 )
                 return
 
-            lines = [f"📋 <b>Все слоты по фильтру на 3 недели ({len(slots)} шт.):</b>\n"]
+            lines = [f"📋 <b>Все найденные слоты по фильтру ({len(slots)} шт.):</b>\n"]
             buttons = []
             for s in slots[:18]:
                 lines.append(self.format_slot_card(s))
@@ -658,11 +676,11 @@ class TelegramBot:
                 sp_label = override_sport or (", ".join(sports) if sports else "Все секции")
                 await self.send_message(
                     chat_id,
-                    f"🔍 <b>Проверка на 3 недели вперёд ({datetime.now().strftime('%H:%M:%S')})</b>\n"
+                    f"🔍 <b>Результаты поиска ({datetime.now().strftime('%H:%M:%S')})</b>\n"
                     f"Фильтр: <b>{html.escape(sp_label)}</b>\n"
                     f"Всего подходящих слотов в расписании: <b>{total_found}</b>.\n"
                     "Доступных для записи слотов со свободными местами сейчас <b>нет (0)</b>.\n\n"
-                    "Я сканирую расписание каждый час и сразу пришлю уведомление, как только появится место!",
+                    "Я проверяю расписание каждые 15 минут (а в 00:00–00:10 по МСК — каждые 30 сек) и сразу пришлю уведомление, как только появится место!",
                     reply_markup=self.group_inline_keyboard() if chat_id != user_id else None,
                 )
             return
@@ -993,10 +1011,10 @@ class TelegramBot:
                 )
                 return
             if data == "scan_free":
-                await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Ищу доступные слоты на 3 недели..."})
+                await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Ищу доступные слоты..."})
                 await self.run_user_scan(chat_id, user_id, show_all=False, manual=True)
             elif data == "scan_all":
-                await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Загружаю все слоты на 3 недели..."})
+                await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Загружаю все слоты по фильтру..."})
                 await self.run_user_scan(chat_id, user_id, show_all=True, manual=True)
             else:
                 sp_name = data.split(":", 1)[1]
@@ -1345,11 +1363,11 @@ class TelegramBot:
                     chat_id,
                     "🏸 <b>Привет! Я бот мониторинга и записи на физкультуру ИТМО (my.itmo.ru).</b>\n\n"
                     "<b>Команды в групповом чате:</b>\n"
-                    "• <code>/slots [секция]</code> — найти свободные места на 3 недели вперёд (например, <code>/slots бадминтон</code> или <code>/slots волейбол</code>)\n"
+                    "• <code>/slots [секция]</code> — найти свободные места (например, <code>/slots бадминтон</code> или <code>/slots волейбол</code>)\n"
                     "• <code>/score</code> — показать твои баллы за физру и прогресс до зачёта\n"
                     "• <code>/my</code> — показать твои будущие записи на занятия\n"
                     "• <code>/board</code> — топ баллов за физру среди участников чата\n\n"
-                    "<i>💡 Чтобы записываться в 1 клик и настроить личный ежечасный мониторинг — напиши мне <code>/start</code> в личные сообщения!</i>",
+                    "<i>💡 Чтобы записываться в 1 клик и настроить личный мониторинг (каждые 15 мин) — напиши мне <code>/start</code> в личные сообщения!</i>",
                     reply_markup=self.group_inline_keyboard(),
                 )
             else:
@@ -1422,13 +1440,13 @@ class TelegramBot:
                 return
             client = self.get_client_for_user(user_id)
             client.set_manual_token(arg_str)
-            await self.send_message(chat_id, "✅ Токен сохранен! Проверяю доступные слоты на 3 недели вперёд...")
+            await self.send_message(chat_id, "✅ Токен сохранен! Проверяю доступные слоты...")
             await self.run_user_scan(chat_id, user_id, show_all=False, manual=True)
             return
 
         if cmd == "/interval":
             if not arg_str.isdigit() or int(arg_str) < 1:
-                await self.send_message(chat_id, "Укажи интервал в минутах (от 1), например: <code>/interval 60</code>")
+                await self.send_message(chat_id, "Укажи интервал в минутах (от 1), например: <code>/interval 15</code>")
                 return
             self.db.setdefault("meta", {})["check_interval_minutes"] = int(arg_str)
             save_db(self.db)
@@ -1437,9 +1455,13 @@ class TelegramBot:
 
     # ─── Background Loops ────────────────────────────────────────────────────
 
-    async def check_inactivity_and_scan(self) -> None:
+    async def check_inactivity_and_scan(self, is_rush: bool = False) -> None:
         now = time.time()
         users = list((self.db.get("users") or {}).items())
+        # In midnight rush, prioritize users with auto sign-up enabled first!
+        if is_rush:
+            users.sort(key=lambda item: not item[1].get("auto_sign_up", False))
+
         for uid, prof in users:
             user_id = int(uid)
             if not prof.get("monitoring_active", True):
@@ -1460,7 +1482,7 @@ class TelegramBot:
                     await self.send_message(
                         user_id,
                         "💤 <b>Автоматический поиск поставлен на паузу</b>\n\n"
-                        "Ты не взаимодействовал с ботом больше <b>3 недель</b>, поэтому мы временно исключили тебя из ежечасного сканирования слотов.\n\n"
+                        "Ты не взаимодействовал с ботом больше <b>3 недель</b>, поэтому мы временно исключили тебя из регулярного сканирования слотов.\n\n"
                         "Нажми кнопку ниже в любой момент, чтобы снова включить мониторинг!",
                         reply_markup=kb,
                     )
@@ -1469,20 +1491,40 @@ class TelegramBot:
                 continue
 
             if self.is_user_authenticated(prof):
-                logger.info(f"Scheduled scan for user {user_id}...")
+                tag = "🌙 [Midnight Rush]" if is_rush else "🕒 [Scan]"
+                logger.info(f"{tag} Scheduled scan for user {user_id} (auto_sign={prof.get('auto_sign_up')})...")
                 await self.run_user_scan(user_id, user_id, show_all=False, manual=False)
-                await asyncio.sleep(2)
+                # Polite spacing: 1.0s in midnight rush, 2.0s in regular scan
+                await asyncio.sleep(1.0 if is_rush else 2.0)
 
     async def scheduler_loop(self) -> None:
-        logger.info("Background multi-user slot scanner started.")
+        logger.info("Background multi-user slot scanner started (15m interval + 00:00-00:10 MSK rush).")
         while True:
-            interval_min = int((self.db.get("meta") or {}).get("check_interval_minutes", 60))
-            interval_sec = max(60, interval_min * 60)
+            is_rush = is_midnight_rush()
             try:
-                await self.check_inactivity_and_scan()
+                await self.check_inactivity_and_scan(is_rush=is_rush)
             except Exception as e:
                 logger.warning(f"Error in scheduler loop: {e}")
-            await asyncio.sleep(interval_sec)
+
+            # Calculate next sleep interval
+            now_msk = datetime.now(MSK_TZ)
+            if now_msk.hour == 0 and 0 <= now_msk.minute < 10:
+                # Still inside Midnight Rush window: sleep 30 seconds
+                sleep_sec = MIDNIGHT_RUSH_INTERVAL_SEC
+                logger.info(f"🌙 Midnight rush active: next high-speed check in {int(sleep_sec)}s")
+            else:
+                interval_min = int((self.db.get("meta") or {}).get("check_interval_minutes", DEFAULT_CHECK_INTERVAL_MINUTES))
+                interval_sec = max(60.0, float(interval_min * 60))
+
+                # Calculate seconds until next 00:00:01 MSK so we never miss the midnight drop!
+                tomorrow = (now_msk + timedelta(days=1)).replace(hour=0, minute=0, second=1, microsecond=0)
+                secs_to_midnight = (tomorrow - now_msk).total_seconds()
+
+                # Sleep interval or time to midnight, whichever is shorter
+                sleep_sec = min(interval_sec, max(5.0, secs_to_midnight))
+                logger.info(f"🕒 Next slot scan in {int(sleep_sec // 60)}m {int(sleep_sec % 60)}s (MSK: {now_msk.strftime('%H:%M:%S')})")
+
+            await asyncio.sleep(sleep_sec)
 
     async def polling_loop(self) -> None:
         me = await self.tg_call("getMe")
@@ -1499,7 +1541,7 @@ class TelegramBot:
                 "commands": [
                     {"command": "start", "description": "Главное меню и панель управления"},
                     {"command": "check", "description": "Проверить доступные свободные слоты"},
-                    {"command": "all", "description": "Показать все слоты по фильтру (3 недели)"},
+                    {"command": "all", "description": "Показать все слоты по фильтру"},
                     {"command": "score", "description": "Мои баллы за физру и прогресс до зачёта"},
                     {"command": "my", "description": "Мои будущие записи и отписка"},
                     {"command": "settings", "description": "Настроить секции, дни, время и автозапись"},
@@ -1543,21 +1585,37 @@ async def main() -> None:
     db = load_db()
     bot = TelegramBot(bot_token, db)
 
-    # Notify existing users about the v3 update once
+    # Notify existing users about the v3.2 update once
     meta = db.setdefault("meta", {})
-    if not meta.get("notified_update_v3"):
-        meta["notified_update_v3"] = True
+    if not meta.get("notified_update_v3_2"):
+        meta["notified_update_v3_2"] = True
         save_db(db)
+        update_text = (
+            "🍕 <b>Админ хотел разогреть чебупиццу, но случайно выкатил обновление 3.2!</b>\n\n"
+            "Что нового в этой версии:\n"
+            "⚡️ <b>Турбо-мониторинг:</b> теперь проверяем новые слоты каждые <b>15 минут</b> вместо часа!\n"
+            "🌙 <b>Режим «Полуночный раш» (00:00 – 00:10 по МСК):</b> когда в полночь выкатывают слоты на новые дни, бот проверяет их каждые 30 секунд — шансы записаться первыми максимальны!\n"
+            "🛡️ <b>Умный антиспам:</b> бот летает быстрее, а аккаунты надежно защищены от перегрузок.\n"
+            "🔒 <b>Безопасность:</b> пароли больше вообще не хранятся на сервере — только защищенные токены сессии.\n"
+            "🏸 <b>Быстрый поиск:</b> убрали лишние слова, поиск теперь работает еще удобнее.\n\n"
+            "<i>Автозапись и уведомления работают в штатном режиме. Приятных тренировок!</i>\n\n"
+            "👨‍💻 <b>Авторство патча:</b>\n"
+            "• 80% Gemini Flash ⚡️\n"
+            "• 17% Claude Sonnet 🧠\n"
+            "• 2% Ди Каприо 🍸\n"
+            "• 1% глупи админ 🍕"
+        )
         for uid, prof in (db.get("users") or {}).items():
             try:
                 cid = int(uid)
                 await bot.send_message(
                     cid,
-                    bot.format_user_dashboard(prof),
+                    update_text,
                     reply_markup=bot.reply_keyboard(),
                 )
+                await asyncio.sleep(0.05)
             except Exception as e:
-                logger.warning(f"Could not send v3 update notice to {uid}: {e}")
+                logger.warning(f"Could not send v3.2 update notice to {uid}: {e}")
 
     await asyncio.gather(
         bot.polling_loop(),
