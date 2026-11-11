@@ -455,7 +455,7 @@ class TelegramBot:
             f"• <b>Дни:</b> {days_str}\n"
             f"• <b>Время:</b> {times_str}\n"
             f"• <b>Корпус:</b> {blds_str}\n\n"
-            "<i>💡 При неактивности более 3 недель автоматический поиск ставится на паузу с уведомлением.</i>"
+            "<i>💡 При долгой неактивности автоматический поиск ставится на паузу с уведомлением.</i>"
         )
 
     def format_slot_card(self, slot: dict[str, Any]) -> str:
@@ -468,46 +468,50 @@ class TelegramBot:
             for r in reasons
         )
 
-        collision = (
-            not is_signed
-            and (
-                slot.get("has_collision")
-                or slot.get("has_intersection")
-                or any(
-                    any(kw in str(r).lower() for kw in (
-                        "в это время", "пересеч", "колли", "совпад", "collision", "conflict",
-                        "другое занятие", "другой урок", "пара в это время",
-                    ))
-                    for r in reasons
-                )
-            )
+        has_academic_collision = bool(slot.get("has_intersection"))
+        has_pe_collision = any(
+            any(kw in str(r).lower() for kw in (
+                "в это время", "пересеч", "колли", "совпад", "collision", "conflict",
+                "другое занятие", "другой урок", "пара в это время",
+            ))
+            for r in reasons
         )
+        collision = (not is_signed) and (has_academic_collision or has_pe_collision or slot.get("has_collision"))
 
         can_sign = slot.get("can_sign_in", False)
 
+        # Header status icon
         if is_signed:
             status_icon = "📌 <b>ТЫ ЗАПИСАН</b>"
+        elif avail > 0:
+            status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>"
+        else:
+            status_icon = "🔴 Мест нет"
+
+        # Section title badge
+        if has_academic_collision:
+            collision_badge = " ⚠️ <i>(коллизия с парой)</i>"
+        elif has_pe_collision or collision:
+            collision_badge = " ⚠️ <i>(коллизия в расписании)</i>"
+        else:
+            collision_badge = ""
+
+        sec_title = f"<b>{html.escape(slot['section_name'])}</b>{collision_badge}"
+
+        # Footer registration status
+        if is_signed:
             sign_str = "✅ <b>Ты уже записан на это занятие</b>"
-        elif collision:
-            status_icon = "⚠️ <b>КОЛЛИЗИЯ</b>" if avail > 0 else "🔴 Мест нет"
-            if can_sign:
-                sign_str = "⚠️ <b>Пересекается с учебным расписанием (парой)</b> | ✅ Запись доступна"
-            else:
-                col_msgs = [r for r in reasons if any(k in str(r).lower() for k in ("в это время", "пересеч", "колли", "совпад"))]
-                detail = "; ".join(html.escape(str(r)) for r in col_msgs) if col_msgs else "пересечение в расписании"
-                sign_str = f"⚠️ <b>Коллизия расписания:</b> {detail}"
         elif can_sign:
-            status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
             sign_str = "✅ Доступно для записи"
         elif reasons:
-            status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
             sign_str = "⚠️ " + "; ".join(html.escape(str(r)) for r in reasons)
+        elif avail == 0:
+            sign_str = "🔴 Мест нет"
         else:
-            status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
             sign_str = "🔴 Запись закрыта"
 
         return (
-            f"{status_icon} — <b>{html.escape(slot['section_name'])}</b>\n"
+            f"{status_icon} — {sec_title}\n"
             f"📅 <b>{slot['date']} ({slot['weekday_name']})</b> | 🕒 <b>{slot['time_start']}–{slot['time_end']}</b>\n"
             f"📍 {html.escape(slot['room_name'])}\n"
             f"👤 {html.escape(slot['teacher_fio'])}\n"
