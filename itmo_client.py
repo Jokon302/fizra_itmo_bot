@@ -469,26 +469,24 @@ class ItmoSportClient:
                     can_sign = bool(can_sign_obj.get("can_sign_in", False))
                     reasons = can_sign_obj.get("unavailable_reasons") or []
 
-                    # 1. User is already enrolled in this exact lesson
-                    is_signed = any(
+                    # 1. User is already enrolled in this exact lesson (from lesson.signed or reasons)
+                    is_signed = bool(lesson.get("signed")) or any(
                         any(kw in str(r).lower() for kw in ("уже записан", "вы записаны", "already signed"))
                         for r in reasons
                     )
 
-                    # 2. Schedule collision with another lesson/pair (strictly NOT this exact lesson)
-                    collision = (
-                        not is_signed
-                        and (
-                            bool(can_sign_obj.get("has_collision"))
-                            or any(
-                                any(kw in str(r).lower() for kw in (
-                                    "колли", "пересеч", "совпад", "collision", "conflict",
-                                    "другое занятие", "другой урок", "пара в это время",
-                                ))
-                                for r in reasons
-                            )
-                        )
+                    # 2. Schedule collision:
+                    # In ITMO API, lesson["intersection"] indicates an academic collision (math, lectures, etc.)!
+                    # Also reasons like "Есть запись на занятия в это время" indicates a clash with another PE lesson.
+                    has_intersection = bool(lesson.get("intersection")) or bool(can_sign_obj.get("has_collision"))
+                    has_col_reason = any(
+                        any(kw in str(r).lower() for kw in (
+                            "в это время", "пересеч", "колли", "совпад", "collision", "conflict",
+                            "другое занятие", "другой урок", "пара в это время",
+                        ))
+                        for r in reasons
                     )
+                    collision = (not is_signed) and (has_intersection or has_col_reason)
 
                     matched_lessons.append(
                         {
@@ -507,6 +505,7 @@ class ItmoSportClient:
                             "can_sign_in": can_sign,
                             "is_signed_up": is_signed,
                             "has_collision": collision,
+                            "has_intersection": has_intersection,
                             "unavailable_reasons": reasons,
                         }
                     )

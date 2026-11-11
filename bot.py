@@ -472,9 +472,10 @@ class TelegramBot:
             not is_signed
             and (
                 slot.get("has_collision")
+                or slot.get("has_intersection")
                 or any(
                     any(kw in str(r).lower() for kw in (
-                        "колли", "пересеч", "совпад", "collision", "conflict",
+                        "в это время", "пересеч", "колли", "совпад", "collision", "conflict",
                         "другое занятие", "другой урок", "пара в это время",
                     ))
                     for r in reasons
@@ -482,15 +483,22 @@ class TelegramBot:
             )
         )
 
+        can_sign = slot.get("can_sign_in", False)
+
         if is_signed:
             status_icon = "📌 <b>ТЫ ЗАПИСАН</b>"
             sign_str = "✅ <b>Ты уже записан на это занятие</b>"
-        elif slot.get("can_sign_in"):
-            status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
-            sign_str = "✅ Доступно для записи"
         elif collision:
             status_icon = "⚠️ <b>КОЛЛИЗИЯ</b>" if avail > 0 else "🔴 Мест нет"
-            sign_str = "⚠️ Коллизия расписания (пересечение с другой парой/занятием)"
+            if can_sign:
+                sign_str = "⚠️ <b>Пересекается с учебным расписанием (парой)</b> | ✅ Запись доступна"
+            else:
+                col_msgs = [r for r in reasons if any(k in str(r).lower() for k in ("в это время", "пересеч", "колли", "совпад"))]
+                detail = "; ".join(html.escape(str(r)) for r in col_msgs) if col_msgs else "пересечение в расписании"
+                sign_str = f"⚠️ <b>Коллизия расписания:</b> {detail}"
+        elif can_sign:
+            status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
+            sign_str = "✅ Доступно для записи"
         elif reasons:
             status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
             sign_str = "⚠️ " + "; ".join(html.escape(str(r)) for r in reasons)
