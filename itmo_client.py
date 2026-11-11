@@ -69,7 +69,7 @@ class ItmoSportClient:
             self.on_tokens_updated(
                 {
                     "login": self.login,
-                    "password": self.password,
+                    "password": None,          # Never persist the password after first login
                     "access_token": self.access_token,
                     "refresh_token": self.refresh_token,
                     "expires_at": self.expires_at,
@@ -173,6 +173,8 @@ class ItmoSportClient:
             self.access_token = tdata["access_token"]
             self.refresh_token = tdata.get("refresh_token")
             self.expires_at = time.time() + float(tdata.get("expires_in", 1800)) - 60
+            # Discard the password from memory — only tokens are needed from now on
+            self.password = None
             self._notify_tokens()
             logger.info("Successfully authenticated with ITMO ID via OAuth2 PKCE.")
             return self.access_token
