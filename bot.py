@@ -396,17 +396,31 @@ class TelegramBot:
         avail = slot["available"]
         limit = slot["limit"]
         status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
-        can_sign_str = "✅ Доступно для записи" if slot["can_sign_in"] else (
-            "⚠️ " + ", ".join(slot["unavailable_reasons"])
-            if slot["unavailable_reasons"]
-            else "⚠️ Запись недоступна"
+
+        reasons = slot.get("unavailable_reasons") or []
+        collision = slot.get("has_collision") or any(
+            any(kw in str(r).lower() for kw in (
+                "колли", "пересеч", "совпад", "collision", "conflict",
+                "другое занятие", "другой урок", "уже записан", "occupied",
+            ))
+            for r in reasons
         )
+
+        if slot["can_sign_in"]:
+            sign_str = "✅ Доступно для записи"
+        elif collision:
+            sign_str = "⚠️ Коллизия расписания (пересечение с другим занятием)"
+        elif reasons:
+            sign_str = "⚠️ " + "; ".join(html.escape(str(r)) for r in reasons)
+        else:
+            sign_str = "⚠️ Запись недоступна"
+
         return (
             f"{status_icon} — <b>{html.escape(slot['section_name'])}</b>\n"
             f"📅 <b>{slot['date']} ({slot['weekday_name']})</b> | 🕒 <b>{slot['time_start']}–{slot['time_end']}</b>\n"
             f"📍 {html.escape(slot['room_name'])}\n"
             f"👤 {html.escape(slot['teacher_fio'])}\n"
-            f"👥 Свободно: <b>{avail} из {limit}</b> | {html.escape(can_sign_str)}"
+            f"👥 Свободно: <b>{avail} из {limit}</b> | {sign_str}"
         )
 
     def format_score_card(self, prof: dict[str, Any], data: dict[str, Any]) -> str:
@@ -523,16 +537,20 @@ class TelegramBot:
         override_sport: str | None = None,
     ) -> None:
         prof = self.get_user(user_id, touch=manual)
-        client = self.get_client_for_user(user_id) if self.is_user_authenticated(prof) else self.get_any_authenticated_client()
 
-        if not client:
+        # Only use the user's own authenticated client — never fall back to another user's tokens
+        if not self.is_user_authenticated(prof):
             if manual:
                 await self.send_message(
                     chat_id,
-                    "🔑 <b>Для поиска слотов нужна авторизация в my.itmo.ru!</b>\n\n"
-                    "Нажми кнопку <b>«👤 Профиль» → «🔑 Войти в аккаунт ИСУ»</b> (или напиши в ЛС бота <code>/login ТВОЙ_ИСУ ТВОЙ_ПАРОЛЬ</code>).",
+                    "🔑 <b>Для поиска слотов нужно войти в свой аккаунт ИСУ!</b>\n\n"
+                    "Нажми кнопку <b>«👤 Профиль» → «🔑 Войти в аккаунт ИСУ»</b> или напиши:\n"
+                    "<code>/login ТВОЙ_ИСУ ТВОЙ_ПАРОЛЬ</code>",
+                    reply_markup=self.profile_inline_keyboard(prof) if chat_id == user_id else None,
                 )
             return
+
+        client = self.get_client_for_user(user_id)
 
         sports = [override_sport] if override_sport else (prof.get("sports") or [])
         weekdays = [] if override_sport else (prof.get("weekdays") or [])
