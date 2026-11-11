@@ -75,7 +75,7 @@
 3. Укажите в `.env` токен вашего бота (от [@BotFather](https://t.me/BotFather)) и ваш Telegram User ID:
    ```env
    TELEGRAM_BOT_TOKEN=1234567890:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
-   ADMIN_USER_ID=5565904991
+   ADMIN_USER_ID=123456789
    ```
 
 4. Запустите контейнер:
