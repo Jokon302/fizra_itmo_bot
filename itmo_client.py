@@ -468,14 +468,27 @@ class ItmoSportClient:
                     can_sign_obj = lesson.get("can_sign_in") or {}
                     can_sign = bool(can_sign_obj.get("can_sign_in", False))
                     reasons = can_sign_obj.get("unavailable_reasons") or []
-                    # Detect schedule collision (пересечение с другим занятием)
-                    collision = bool(can_sign_obj.get("has_collision") or any(
-                        any(kw in str(r).lower() for kw in (
-                            "колли", "пересеч", "совпад", "collision", "conflict",
-                            "другое занятие", "другой урок", "уже записан", "occupied",
-                        ))
+
+                    # 1. User is already enrolled in this exact lesson
+                    is_signed = any(
+                        any(kw in str(r).lower() for kw in ("уже записан", "вы записаны", "already signed"))
                         for r in reasons
-                    ))
+                    )
+
+                    # 2. Schedule collision with another lesson/pair (strictly NOT this exact lesson)
+                    collision = (
+                        not is_signed
+                        and (
+                            bool(can_sign_obj.get("has_collision"))
+                            or any(
+                                any(kw in str(r).lower() for kw in (
+                                    "колли", "пересеч", "совпад", "collision", "conflict",
+                                    "другое занятие", "другой урок", "пара в это время",
+                                ))
+                                for r in reasons
+                            )
+                        )
+                    )
 
                     matched_lessons.append(
                         {
@@ -492,6 +505,7 @@ class ItmoSportClient:
                             "available": available,
                             "limit": limit_total,
                             "can_sign_in": can_sign,
+                            "is_signed_up": is_signed,
                             "has_collision": collision,
                             "unavailable_reasons": reasons,
                         }

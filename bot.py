@@ -452,25 +452,42 @@ class TelegramBot:
     def format_slot_card(self, slot: dict[str, Any]) -> str:
         avail = slot["available"]
         limit = slot["limit"]
-        status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
-
         reasons = slot.get("unavailable_reasons") or []
-        collision = slot.get("has_collision") or any(
-            any(kw in str(r).lower() for kw in (
-                "колли", "пересеч", "совпад", "collision", "conflict",
-                "другое занятие", "другой урок", "уже записан", "occupied",
-            ))
+
+        is_signed = slot.get("is_signed_up") or any(
+            any(kw in str(r).lower() for kw in ("уже записан", "вы записаны", "already signed"))
             for r in reasons
         )
 
-        if slot["can_sign_in"]:
+        collision = (
+            not is_signed
+            and (
+                slot.get("has_collision")
+                or any(
+                    any(kw in str(r).lower() for kw in (
+                        "колли", "пересеч", "совпад", "collision", "conflict",
+                        "другое занятие", "другой урок", "пара в это время",
+                    ))
+                    for r in reasons
+                )
+            )
+        )
+
+        if is_signed:
+            status_icon = "📌 <b>ТЫ ЗАПИСАН</b>"
+            sign_str = "✅ <b>Ты уже записан на это занятие</b>"
+        elif slot.get("can_sign_in"):
+            status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
             sign_str = "✅ Доступно для записи"
         elif collision:
-            sign_str = "⚠️ Коллизия расписания (пересечение с другим занятием)"
+            status_icon = "⚠️ <b>КОЛЛИЗИЯ</b>" if avail > 0 else "🔴 Мест нет"
+            sign_str = "⚠️ Коллизия расписания (пересечение с другой парой/занятием)"
         elif reasons:
+            status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
             sign_str = "⚠️ " + "; ".join(html.escape(str(r)) for r in reasons)
         else:
-            sign_str = "⚠️ Запись недоступна"
+            status_icon = "🟢 <b>ЕСТЬ МЕСТА</b>" if avail > 0 else "🔴 Мест нет"
+            sign_str = "🔴 Запись закрыта"
 
         return (
             f"{status_icon} — <b>{html.escape(slot['section_name'])}</b>\n"
@@ -649,7 +666,17 @@ class TelegramBot:
             for s in slots[:18]:
                 lines.append(self.format_slot_card(s))
                 lines.append("")
-                if s["available"] > 0 and s["can_sign_in"]:
+                if s.get("is_signed_up"):
+                    if chat_id == user_id:
+                        buttons.append(
+                            [
+                                {
+                                    "text": f"❌ Отписаться: {s['date']} {s['time_start']} ({s['section_name']})",
+                                    "callback_data": f"unsub:{s['id']}",
+                                }
+                            ]
+                        )
+                elif s["available"] > 0 and s["can_sign_in"]:
                     buttons.append(
                         [
                             {
@@ -663,11 +690,11 @@ class TelegramBot:
             await self.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": buttons} if buttons else None)
             return
 
-        # Default mode: ONLY available for sign-in AND available > 0
+        # Default mode: ONLY available for sign-in AND available > 0 (and user not already enrolled)
         # In group override mode, show any slot with available > 0
         free_slots = [
             s for s in slots
-            if s["available"] > 0 and (s["can_sign_in"] or bool(override_sport))
+            if s["available"] > 0 and not s.get("is_signed_up") and (s["can_sign_in"] or bool(override_sport))
         ]
 
         if not free_slots:
