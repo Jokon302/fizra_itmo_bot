@@ -45,6 +45,7 @@ LEADERBOARD_CACHE_TTL = 900.0       # 15 minutes cache for the whole leaderboard
 USER_SCORE_CACHE_TTL = 3600.0      # 1 hour cache per user score (shield other users' accounts from repeated API calls)
 USER_ACTION_MIN_INTERVAL = 3.0     # 3 seconds cooldown between manual API calls per user
 CHAT_BOARD_MIN_INTERVAL = 8.0      # 8 seconds cooldown on /board per chat to avoid group spam
+SLOTS_PER_PAGE = 5                 # Maximum slot cards per message to stay well within Telegram 4096-char limit
 
 POPULAR_SPORTS = [
     "Бадминтон",
@@ -157,6 +158,7 @@ class TelegramBot:
         self._cached_leaderboard: list[tuple[int, str]] = []
         self._leaderboard_updated_at: float = 0.0
         self._leaderboard_lock = asyncio.Lock()
+        self._slot_pages: dict[int, dict[str, Any]] = {}
 
     def check_user_rate_limit(self, user_id: int, action: str = "general", min_interval: float = USER_ACTION_MIN_INTERVAL) -> tuple[bool, float]:
         """
@@ -248,7 +250,10 @@ class TelegramBot:
     async def tg_call(self, method: str, payload: dict[str, Any] | None = None, timeout: float = 35.0) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(f"{self.api_url}/{method}", json=payload or {})
-            return resp.json()
+            res = resp.json()
+            if not res.get("ok"):
+                logger.warning(f"Telegram API {method} error: {res.get('description')} (code {res.get('error_code')})")
+            return res
 
     async def send_message(
         self,
@@ -257,6 +262,8 @@ class TelegramBot:
         reply_markup: dict[str, Any] | None = None,
         reply_to_message_id: int | None = None,
     ) -> dict[str, Any]:
+        if len(text) > 4000:
+            text = text[:3950] + "\n\n<i>[Сообщение сокращено из-за лимита длины Telegram]</i>"
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
@@ -276,6 +283,8 @@ class TelegramBot:
         text: str,
         reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if len(text) > 4000:
+            text = text[:3950] + "\n\n<i>[Сообщение сокращено из-за лимита длины Telegram]</i>"
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -497,6 +506,55 @@ class TelegramBot:
             f"👥 Свободно: <b>{avail} из {limit}</b> | {sign_str}"
         )
 
+    def format_slots_page(self, user_id: int, page: int = 0) -> tuple[str, dict[str, Any] | None]:
+        session = self._slot_pages.get(user_id)
+        if not session or not session.get("slots"):
+            return "📭 Нет сохраненных результатов поиска. Запусти новый поиск через меню.", None
+
+        slots = session["slots"]
+        total = len(slots)
+        total_pages = max(1, (total + SLOTS_PER_PAGE - 1) // SLOTS_PER_PAGE)
+        page = max(0, min(page, total_pages - 1))
+        session["page"] = page
+
+        start_idx = page * SLOTS_PER_PAGE
+        end_idx = min(start_idx + SLOTS_PER_PAGE, total)
+        page_slots = slots[start_idx:end_idx]
+
+        title = session.get("title", "Результаты поиска")
+        lines = [f"{title} (найдено <b>{total}</b>, стр. <b>{page + 1}/{total_pages}</b>):\n"]
+
+        buttons = []
+        for s in page_slots:
+            lines.append(self.format_slot_card(s))
+            lines.append("")
+            if s.get("is_signed_up"):
+                buttons.append([
+                    {
+                        "text": f"❌ Отписаться: {s['date']} {s['time_start']} ({s['section_name']})",
+                        "callback_data": f"unsub:{s['id']}",
+                    }
+                ])
+            elif s.get("available", 0) > 0 and s.get("can_sign_in"):
+                buttons.append([
+                    {
+                        "text": f"✍️ Записаться: {s['date']} ({WEEKDAY_SHORT.get(s['weekday'], '')}) {s['time_start']} — {s['section_name']}",
+                        "callback_data": f"sign:{s['id']}",
+                    }
+                ])
+
+        if total_pages > 1:
+            nav_row = []
+            if page > 0:
+                nav_row.append({"text": "⬅️ Назад", "callback_data": f"slot_pg:{page - 1}"})
+            nav_row.append({"text": f"📄 {page + 1}/{total_pages}", "callback_data": "slot_pg:noop"})
+            if page < total_pages - 1:
+                nav_row.append({"text": "Вперёд ➡️", "callback_data": f"slot_pg:{page + 1}"})
+            buttons.append(nav_row)
+
+        reply_markup = {"inline_keyboard": buttons} if buttons else None
+        return "\n".join(lines), reply_markup
+
     def format_score_card(self, prof: dict[str, Any], data: dict[str, Any]) -> str:
         sem = data.get("semester") or {}
         score_obj = data.get("score") or {}
@@ -661,33 +719,14 @@ class TelegramBot:
                 )
                 return
 
-            lines = [f"📋 <b>Все найденные слоты по фильтру ({len(slots)} шт.):</b>\n"]
-            buttons = []
-            for s in slots[:18]:
-                lines.append(self.format_slot_card(s))
-                lines.append("")
-                if s.get("is_signed_up"):
-                    if chat_id == user_id:
-                        buttons.append(
-                            [
-                                {
-                                    "text": f"❌ Отписаться: {s['date']} {s['time_start']} ({s['section_name']})",
-                                    "callback_data": f"unsub:{s['id']}",
-                                }
-                            ]
-                        )
-                elif s["available"] > 0 and s["can_sign_in"]:
-                    buttons.append(
-                        [
-                            {
-                                "text": f"✍️ Записаться: {s['date']} ({WEEKDAY_SHORT.get(s['weekday'], '')}) {s['time_start']} — {s['section_name']}",
-                                "callback_data": f"sign:{s['id']}",
-                            }
-                        ]
-                    )
-            if len(slots) > 18:
-                lines.append(f"<i>...и ещё {len(slots) - 18} слотов (сузь фильтр в «⚙️ Настройки поиска»).</i>")
-            await self.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": buttons} if buttons else None)
+            self._slot_pages[user_id] = {
+                "slots": slots,
+                "title": "📋 <b>Все слоты по фильтру</b>",
+                "chat_id": chat_id,
+                "ts": time.time(),
+            }
+            text, reply_markup = self.format_slots_page(user_id, page=0)
+            await self.send_message(chat_id, text, reply_markup=reply_markup)
             return
 
         # Default mode: ONLY available for sign-in AND available > 0 (and user not already enrolled)
@@ -713,20 +752,14 @@ class TelegramBot:
             return
 
         if manual:
-            lines = [f"🟢 <b>Найдены доступные слоты со свободными местами ({len(free_slots)} шт.):</b>\n"]
-            buttons = []
-            for s in free_slots[:15]:
-                lines.append(self.format_slot_card(s))
-                lines.append("")
-                buttons.append(
-                    [
-                        {
-                            "text": f"✍️ Записаться: {s['date']} ({WEEKDAY_SHORT.get(s['weekday'], '')}) {s['time_start']} — {s['section_name']}",
-                            "callback_data": f"sign:{s['id']}",
-                        }
-                    ]
-                )
-            await self.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": buttons} if buttons else None)
+            self._slot_pages[user_id] = {
+                "slots": free_slots,
+                "title": "🟢 <b>Доступные слоты со свободными местами</b>",
+                "chat_id": chat_id,
+                "ts": time.time(),
+            }
+            text, reply_markup = self.format_slots_page(user_id, page=0)
+            await self.send_message(chat_id, text, reply_markup=reply_markup)
             return
 
         # Background scheduled notification for a specific user
@@ -1105,6 +1138,12 @@ class TelegramBot:
             try:
                 res = await client.sign_up_lesson(lesson_id)
                 if res.get("error_code") == 0:
+                    if user_id in self._slot_pages:
+                        for sl in self._slot_pages[user_id].get("slots", []):
+                            if sl["id"] == lesson_id:
+                                sl["is_signed_up"] = True
+                                sl["can_sign_in"] = False
+                                sl["available"] = max(0, sl.get("available", 1) - 1)
                     await self.send_message(
                         chat_id,
                         f"✅ <b>{html.escape(prof.get('name') or 'Студент')}, ты успешно записан на занятие (ID {lesson_id})!</b>",
@@ -1131,12 +1170,43 @@ class TelegramBot:
             try:
                 ok = await client.unsubscribe_lesson(lesson_id)
                 if ok:
+                    if user_id in self._slot_pages:
+                        for sl in self._slot_pages[user_id].get("slots", []):
+                            if sl["id"] == lesson_id:
+                                sl["is_signed_up"] = False
+                                sl["can_sign_in"] = True
+                                sl["available"] = sl.get("available", 0) + 1
                     await self.send_message(chat_id, f"🗑 <b>Ты успешно отписался от занятия (ID {lesson_id}).</b>")
                     await self.send_chosen_lessons(chat_id, user_id, from_user)
                 else:
                     await self.send_message(chat_id, "⚠️ Не удалось отписаться от занятия.")
             except Exception as e:
                 await self.send_message(chat_id, f"❌ Ошибка при отписке: <code>{html.escape(str(e))}</code>")
+
+        elif data.startswith("slot_pg:"):
+            page_str = data.split(":", 1)[1]
+            if page_str == "noop":
+                session = self._slot_pages.get(user_id)
+                cur_total = len(session.get("slots", [])) if session else 0
+                await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": f"Всего слотов в результатах: {cur_total}"})
+                return
+
+            try:
+                page_num = int(page_str)
+            except ValueError:
+                return
+
+            session = self._slot_pages.get(user_id)
+            if not session or not session.get("slots"):
+                await self.tg_call(
+                    "answerCallbackQuery",
+                    {"callback_query_id": cq_id, "text": "⏳ Результаты устарели. Нажми кнопку поиска заново!", "show_alert": True},
+                )
+                return
+
+            await self.tg_call("answerCallbackQuery", {"callback_query_id": cq_id})
+            text, reply_markup = self.format_slots_page(user_id, page=page_num)
+            await self.edit_message(chat_id, msg_id, text, reply_markup=reply_markup)
 
     async def get_or_refresh_leaderboard(self) -> tuple[list[tuple[int, str]], float]:
         """
